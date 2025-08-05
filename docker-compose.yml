@@ -1,0 +1,25 @@
+services:
+  sgp-bot:
+    build: .
+    container_name: sgp-bot
+    restart: unless-stopped
+    env_file:
+      - .env
+    volumes:
+      # Mount the signal-cli socket from host
+      - /run/user/1000/signal-cli:/run/user/1000/signal-cli
+    networks:
+      - default
+    depends_on: []
+    
+    # Optional: Add health check
+    healthcheck:
+      test: ["CMD", "ps", "aux", "|", "grep", "python"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+
+networks:
+  default:
+    driver: bridge
