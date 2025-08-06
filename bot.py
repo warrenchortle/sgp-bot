@@ -68,20 +68,41 @@ def init_bluesky_client():
 
 def at_uri_to_bsky_url(at_uri, handle=None):
     """Convert AT URI to bsky.app URL, optionally using handle instead of DID"""
-    pattern = r'^at://([^/]+)/([^/]+)/([^/]+)$'
+    pattern = r"^at://([^/]+)/([^/]+)/([^/]+)$"
     match = re.match(pattern, at_uri)
-    
+
     if not match:
         return None
-    
+
     did, collection, rkey = match.groups()
-    
-    if collection == 'app.bsky.feed.post':
+
+    if collection == "app.bsky.feed.post":
         # Use handle if provided, otherwise use DID
         profile_id = handle if handle else did
-        return f'https://bsky.app/profile/{profile_id}/post/{rkey}'
+        return f"https://bsky.app/profile/{profile_id}/post/{rkey}"
     else:
         return None
+
+
+def bsky_url_to_at_uri(url):
+    """Convert bsky.app URL back to AT URI"""
+    # Pattern for https://bsky.app/profile/{handle_or_did}/post/{rkey}
+    pattern = r"^https://bsky\.app/profile/([^/]+)/post/([^/]+)$"
+    match = re.match(pattern, url)
+
+    if not match:
+        return None
+
+    profile_id, rkey = match.groups()
+
+    # If profile_id is a handle, we need to resolve it to a DID
+    # For now, we'll construct the AT URI with what we have
+    # The actual DID resolution would need to be done via the client
+    return {
+        "profile_id": profile_id,
+        "rkey": rkey,
+        "needs_resolution": not profile_id.startswith("did:"),
+    }
 
 
 def post_to_bluesky(client, text):
@@ -89,24 +110,105 @@ def post_to_bluesky(client, text):
     try:
         response = client.send_post(text=text)
         logging.info(f"Successfully posted to Bluesky: {text[:50]}...")
-        
+
         # Convert AT URI to web URL using the handle from BSKY_USER
         # Extract just the username part (before .bsky.social if present)
         handle = BSKY_USER
-        if not handle.endswith('.bsky.social'):
+        if not handle.endswith(".bsky.social"):
             handle = f"{handle}.bsky.social"
-        
+
         post_url = at_uri_to_bsky_url(response.uri, handle)
-        
+
         return {
-            'success': True,
-            'uri': response.uri,
-            'cid': response.cid,
-            'url': post_url
+            "success": True,
+            "uri": response.uri,
+            "cid": response.cid,
+            "url": post_url,
         }
     except Exception as e:
         logging.error(f"Failed to post to Bluesky: {e}")
-        return {'success': False, 'error': str(e)}
+        return {"success": False, "error": str(e)}
+
+
+def get_latest_post(client):
+    """Get the most recent post from the authenticated user"""
+    try:
+        # Get the user's profile timeline (their posts)
+        timeline = client.get_author_feed(client.me.did, limit=1)
+        
+        if not timeline.feed or len(timeline.feed) == 0:
+            return {"success": False, "error": "No posts found"}
+        
+        post = timeline.feed[0].post
+        
+        # Convert AT URI to web URL using handle
+        handle = BSKY_USER
+        if not handle.endswith(".bsky.social"):
+            handle = f"{handle}.bsky.social"
+        
+        post_url = at_uri_to_bsky_url(post.uri, handle)
+        
+        return {
+            "success": True,
+            "uri": post.uri,
+            "cid": post.cid,
+            "url": post_url,
+            "text": post.record.text[:50] + ("..." if len(post.record.text) > 50 else "")
+        }
+        
+    except Exception as e:
+        logging.error(f"Failed to get latest post: {e}")
+        return {"success": False, "error": str(e)}
+
+
+def delete_bluesky_post(client, url):
+    """Delete a Bluesky post given its URL"""
+    try:
+        # Parse the URL to extract components
+        parsed = bsky_url_to_at_uri(url)
+        if not parsed:
+            return {"success": False, "error": "Invalid Bluesky URL format"}
+
+        profile_id = parsed["profile_id"]
+        rkey = parsed["rkey"]
+
+        # If profile_id is a handle, we need to get the DID
+        if parsed["needs_resolution"]:
+            # Check if it's our own post (comparing handles)
+            handle = profile_id
+            if not handle.endswith(".bsky.social"):
+                handle_check = f"{handle}.bsky.social"
+            else:
+                handle_check = handle
+
+            user_handle = BSKY_USER
+            if not user_handle.endswith(".bsky.social"):
+                user_handle = f"{user_handle}.bsky.social"
+
+            if handle_check.lower() != user_handle.lower():
+                return {"success": False, "error": "Can only delete your own posts"}
+
+            # Use the client's DID for deletion
+            did = client.me.did
+        else:
+            # It's already a DID
+            did = profile_id
+            # Verify it's our own post
+            if did != client.me.did:
+                return {"success": False, "error": "Can only delete your own posts"}
+
+        # Construct the AT URI
+        at_uri = f"at://{did}/app.bsky.feed.post/{rkey}"
+
+        # Delete the post
+        client.delete_post(at_uri)
+        logging.info(f"Successfully deleted post: {at_uri}")
+
+        return {"success": True, "deleted_uri": at_uri}
+
+    except Exception as e:
+        logging.error(f"Failed to delete post: {e}")
+        return {"success": False, "error": str(e)}
 
 
 def send_signal_message(group_id, message):
@@ -262,10 +364,22 @@ def listen_for_posts():
                                     )
                                     continue
 
-                                # Check if message starts with /post or /echo
-                                post_text = extract_command_text(parsed["message"], "post")
-                                echo_text = extract_command_text(parsed["message"], "echo")
+                                # Check if message starts with /post, /delete, /help, or /echo
+                                post_text = extract_command_text(
+                                    parsed["message"], "post"
+                                )
+                                delete_text = extract_command_text(
+                                    parsed["message"], "delete"
+                                )
+                                # Check for /help command (with or without text)
+                                help_text = None
+                                if parsed["message"].strip().lower().startswith("/help"):
+                                    help_text = ""  # Set to empty string to trigger help
                                 
+                                echo_text = extract_command_text(
+                                    parsed["message"], "echo"
+                                )
+
                                 if post_text:
                                     logging.info("DETECTED /post command")
                                     logging.info(
@@ -275,9 +389,9 @@ def listen_for_posts():
 
                                     # Post to Bluesky
                                     result = post_to_bluesky(bluesky_client, post_text)
-                                    if result['success']:
-                                        message = "Posted to Bluesky successfully!"
-                                        if result.get('url'):
+                                    if result["success"]:
+                                        message = "Posted to Bluesky"
+                                        if result.get("url"):
                                             message += f"\n{result['url']}"
                                         send_signal_message(SIGNAL_GROUP, message)
                                         logging.info(
@@ -287,8 +401,85 @@ def listen_for_posts():
                                         send_signal_message(
                                             SIGNAL_GROUP, "L Failed to post to Bluesky"
                                         )
-                                        logging.error(f"Failed to post to Bluesky: {result.get('error')}")
-                                
+                                        logging.error(
+                                            f"Failed to post to Bluesky: {result.get('error')}"
+                                        )
+
+                                elif delete_text:
+                                    logging.info("DETECTED /delete command")
+                                    logging.info(
+                                        f"From: {parsed['source_name']} ({parsed['source_uuid']})"
+                                    )
+                                    
+                                    # Check if it's "delete this" command
+                                    if delete_text.strip().lower() == "this":
+                                        logging.info("Delete this - getting latest post")
+                                        
+                                        # Get the latest post
+                                        latest_result = get_latest_post(bluesky_client)
+                                        if not latest_result["success"]:
+                                            send_signal_message(
+                                                SIGNAL_GROUP,
+                                                f"L Failed to get latest post: {latest_result.get('error')}"
+                                            )
+                                            continue
+                                        
+                                        # Delete the latest post using its URL
+                                        result = delete_bluesky_post(
+                                            bluesky_client, latest_result["url"]
+                                        )
+                                        
+                                        if result["success"]:
+                                            message = f"Deleted latest post from Bluesky\n{latest_result['url']}"
+                                            send_signal_message(SIGNAL_GROUP, message)
+                                            logging.info(
+                                                f"Successfully deleted latest post: {result.get('deleted_uri')}"
+                                            )
+                                        else:
+                                            send_signal_message(
+                                                SIGNAL_GROUP,
+                                                f"L Failed to delete latest post: {result.get('error')}"
+                                            )
+                                            logging.error(
+                                                f"Failed to delete latest post: {result.get('error')}"
+                                            )
+                                    else:
+                                        # Regular delete with URL
+                                        logging.info(f"Delete URL: {delete_text}")
+                                        
+                                        result = delete_bluesky_post(
+                                            bluesky_client, delete_text.strip()
+                                        )
+                                        if result["success"]:
+                                            send_signal_message(
+                                                SIGNAL_GROUP,
+                                                "Post deleted from Bluesky",
+                                            )
+                                            logging.info(
+                                                f"Successfully deleted post from Bluesky: {result.get('deleted_uri')}"
+                                            )
+                                        else:
+                                            send_signal_message(
+                                                SIGNAL_GROUP,
+                                                f"L Failed to delete post: {result.get('error')}",
+                                            )
+                                            logging.error(
+                                                f"Failed to delete post: {result.get('error')}"
+                                            )
+
+                                elif (
+                                    help_text is not None
+                                ):  # Use 'is not None' to handle empty help command
+                                    logging.info("DETECTED /help command")
+                                    help_message = """SGP Bot Commands:
+/post <text> - Post to Bluesky
+/delete <url> - Delete Bluesky post
+/delete this - Delete latest post
+/echo <text> - Echo text back
+/help - Show this help"""
+                                    send_signal_message(SIGNAL_GROUP, help_message)
+                                    logging.info("Sent help message")
+
                                 elif echo_text:
                                     logging.info("DETECTED /echo command")
                                     logging.info(
@@ -342,4 +533,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
