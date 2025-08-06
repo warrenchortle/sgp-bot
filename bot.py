@@ -66,15 +66,47 @@ def init_bluesky_client():
         return None
 
 
+def at_uri_to_bsky_url(at_uri, handle=None):
+    """Convert AT URI to bsky.app URL, optionally using handle instead of DID"""
+    pattern = r'^at://([^/]+)/([^/]+)/([^/]+)$'
+    match = re.match(pattern, at_uri)
+    
+    if not match:
+        return None
+    
+    did, collection, rkey = match.groups()
+    
+    if collection == 'app.bsky.feed.post':
+        # Use handle if provided, otherwise use DID
+        profile_id = handle if handle else did
+        return f'https://bsky.app/profile/{profile_id}/post/{rkey}'
+    else:
+        return None
+
+
 def post_to_bluesky(client, text):
-    """Post text to Bluesky"""
+    """Post text to Bluesky and return post URL"""
     try:
-        client.send_post(text=text)
+        response = client.send_post(text=text)
         logging.info(f"Successfully posted to Bluesky: {text[:50]}...")
-        return True
+        
+        # Convert AT URI to web URL using the handle from BSKY_USER
+        # Extract just the username part (before .bsky.social if present)
+        handle = BSKY_USER
+        if not handle.endswith('.bsky.social'):
+            handle = f"{handle}.bsky.social"
+        
+        post_url = at_uri_to_bsky_url(response.uri, handle)
+        
+        return {
+            'success': True,
+            'uri': response.uri,
+            'cid': response.cid,
+            'url': post_url
+        }
     except Exception as e:
         logging.error(f"Failed to post to Bluesky: {e}")
-        return False
+        return {'success': False, 'error': str(e)}
 
 
 def send_signal_message(group_id, message):
@@ -241,25 +273,21 @@ def listen_for_posts():
                                     )
                                     logging.info(f"Post text: {post_text}")
 
-                                    # Send confirmation to Signal
-                                    send_signal_message(
-                                        SIGNAL_GROUP, "Posting to Bluesky..."
-                                    )
-
                                     # Post to Bluesky
-                                    if post_to_bluesky(bluesky_client, post_text):
-                                        send_signal_message(
-                                            SIGNAL_GROUP,
-                                            "Posted to Bluesky successfully!",
-                                        )
+                                    result = post_to_bluesky(bluesky_client, post_text)
+                                    if result['success']:
+                                        message = "Posted to Bluesky successfully!"
+                                        if result.get('url'):
+                                            message += f"\n{result['url']}"
+                                        send_signal_message(SIGNAL_GROUP, message)
                                         logging.info(
-                                            "Successfully posted to Bluesky and confirmed in Signal"
+                                            f"Successfully posted to Bluesky and confirmed in Signal. URL: {result.get('url')}"
                                         )
                                     else:
                                         send_signal_message(
                                             SIGNAL_GROUP, "L Failed to post to Bluesky"
                                         )
-                                        logging.error("Failed to post to Bluesky")
+                                        logging.error(f"Failed to post to Bluesky: {result.get('error')}")
                                 
                                 elif echo_text:
                                     logging.info("DETECTED /echo command")
