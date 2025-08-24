@@ -211,8 +211,8 @@ def delete_bluesky_post(client, url):
         return {"success": False, "error": str(e)}
 
 
-def send_signal_message(group_id, message):
-    """Send message to Signal group"""
+def send_signal_message(group_id, message, preview_url=None, preview_title=None, preview_description=None, preview_image=None):
+    """Send message to Signal group. If preview fields are provided, include them."""
     req_id = str(uuid.uuid4())
 
     frame = {
@@ -225,6 +225,16 @@ def send_signal_message(group_id, message):
         },
         "id": req_id,
     }
+
+    if preview_url:
+        # Include previewUrl to let Signal render a link preview
+        frame["params"]["previewUrl"] = preview_url
+    if preview_title:
+        frame["params"]["previewTitle"] = preview_title
+    if preview_description:
+        frame["params"]["previewDescription"] = preview_description
+    if preview_image:
+        frame["params"]["previewImage"] = preview_image
 
     try:
         with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
@@ -410,10 +420,27 @@ def listen_for_posts():
                                     # Post to Bluesky
                                     result = post_to_bluesky(bluesky_client, final_post_text)
                                     if result["success"]:
-                                        message = "Posted to Bluesky"
-                                        if result.get("url"):
-                                            message += f"\n{result['url']}"
-                                        send_signal_message(SIGNAL_GROUP, message)
+                                        url = result.get("url")
+                                        if url:
+                                            # Build preview title from env (full account name)
+                                            title = BSKY_USER or ""
+                                            if title and not title.startswith("@"):
+                                                title = f"@{title}"
+                                            # Use the posted text as the preview description
+                                            description = final_post_text
+                                            # Send only the URL and include preview fields for rich preview
+                                            send_signal_message(
+                                                SIGNAL_GROUP,
+                                                url,
+                                                preview_url=url,
+                                                preview_title=title,
+                                                preview_description=description,
+                                            )
+                                        else:
+                                            # Fallback if URL couldn't be derived
+                                            send_signal_message(
+                                                SIGNAL_GROUP, "Posted to Bluesky"
+                                            )
                                         logging.info(
                                             f"Successfully posted to Bluesky and confirmed in Signal. URL: {result.get('url')}"
                                         )

@@ -109,9 +109,8 @@ In your Signal group, send a message starting with `/post` followed by the text 
 
 The bot will:
 1. Detect the `/post` command
-2. Send a "📤 Posting to Bluesky..." confirmation
-3. Post the text to Bluesky
-4. Send either "✅ Posted to Bluesky successfully!" or "❌ Failed to post to Bluesky"
+2. Post the text to Bluesky
+3. Reply in Signal with only the Bluesky post URL (and a rich preview)
 
 You can also reply with `/post` to any message in the group. If your `/post` message includes a quote (i.e., you replied to a message), the bot will ignore any text typed after `/post` and will post the quoted message's text instead.
 
