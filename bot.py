@@ -285,6 +285,16 @@ def parse_signal_message(message_data):
             "is_group": False,
         }
 
+        # Detect and capture quote details if present
+        quote = data_message.get("quote")
+        if quote:
+            parsed["quote_id"] = quote.get("id")
+            parsed["quote_author"] = quote.get("author")
+            parsed["quote_text"] = quote.get("text")
+            parsed["has_quote"] = bool(parsed["quote_text"]) if parsed.get("quote_text") is not None else False
+        else:
+            parsed["has_quote"] = False
+
         # Check if it's a group message
         group_info = data_message.get("groupInfo")
         if group_info:
@@ -365,9 +375,17 @@ def listen_for_posts():
                                     continue
 
                                 # Check if message starts with /post, /delete, /help, or /echo
-                                post_text = extract_command_text(
+                                # For /post: prefer quoted text if present
+                                is_post_cmd = parsed["message"].strip().lower().startswith("/post")
+                                inline_post_text = extract_command_text(
                                     parsed["message"], "post"
                                 )
+                                quoted_text = parsed.get("quote_text")
+                                final_post_text = None
+                                if quoted_text and isinstance(quoted_text, str) and quoted_text.strip():
+                                    final_post_text = quoted_text.strip()
+                                elif inline_post_text and inline_post_text.strip():
+                                    final_post_text = inline_post_text.strip()
                                 delete_text = extract_command_text(
                                     parsed["message"], "delete"
                                 )
@@ -380,15 +398,17 @@ def listen_for_posts():
                                     parsed["message"], "echo"
                                 )
 
-                                if post_text:
+                                if is_post_cmd and final_post_text:
                                     logging.info("DETECTED /post command")
                                     logging.info(
                                         f"From: {parsed['source_name']} ({parsed['source_uuid']})"
                                     )
-                                    logging.info(f"Post text: {post_text}")
+                                    if quoted_text and quoted_text.strip():
+                                        logging.info("Using quoted text for /post")
+                                    logging.info(f"Post text: {final_post_text}")
 
                                     # Post to Bluesky
-                                    result = post_to_bluesky(bluesky_client, post_text)
+                                    result = post_to_bluesky(bluesky_client, final_post_text)
                                     if result["success"]:
                                         message = "Posted to Bluesky"
                                         if result.get("url"):
@@ -404,6 +424,12 @@ def listen_for_posts():
                                         logging.error(
                                             f"Failed to post to Bluesky: {result.get('error')}"
                                         )
+                                elif is_post_cmd and not final_post_text:
+                                    # /post command without usable text or quote
+                                    send_signal_message(
+                                        SIGNAL_GROUP,
+                                        "L No text to post. Reply with /post to a message or include text.",
+                                    )
 
                                 elif delete_text:
                                     logging.info("DETECTED /delete command")

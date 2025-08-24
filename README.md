@@ -113,6 +113,8 @@ The bot will:
 3. Post the text to Bluesky
 4. Send either "✅ Posted to Bluesky successfully!" or "❌ Failed to post to Bluesky"
 
+You can also reply with `/post` to any message in the group. If your `/post` message includes a quote (i.e., you replied to a message), the bot will ignore any text typed after `/post` and will post the quoted message's text instead.
+
 ### Examples
 
 ```
@@ -124,6 +126,13 @@ https://github.com/username/project
 /post Multi-line posts work too!
 This is the second line.
 And this is the third.
+
+# Replying to a message with /post (quote handling)
+# The bot will post the quoted message text, ignoring any inline text you add
+# Example usage in Signal:
+# 1) Reply to a message with just: /post
+# 2) Reply to a message with: /post ignore this text
+# In both cases, the quoted message content will be posted.
 ```
 
 ## Testing
