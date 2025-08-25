@@ -5,6 +5,7 @@ Signal to Bluesky Bot - Listens for /post commands and posts to Bluesky
 """
 
 import json
+import base64
 import socket
 import os
 import sys
@@ -23,6 +24,16 @@ SIGNAL_SOCKET_PATH = os.getenv("SIGNAL_SOCKET_PATH", "/run/user/1000/signal-cli/
 SIGNAL_GROUP = os.getenv("SIGNAL_GROUP")
 BSKY_USER = os.getenv("BSKY_USER")
 BSKY_PASS = os.getenv("BSKY_PASS")
+
+# Attachment handling configuration
+MAX_IMAGES_PER_POST = 4
+MAX_ATTACHMENT_SIZE_BYTES = 15 * 1024 * 1024  # 15MB per image
+ALLOWED_IMAGE_MIME = {
+    "image/jpeg",
+    "image/png",
+    "image/webp",
+    "image/gif",
+}
 
 
 def validate_environment():
@@ -105,10 +116,15 @@ def bsky_url_to_at_uri(url):
     }
 
 
-def post_to_bluesky(client, text):
-    """Post text to Bluesky and return post URL"""
+def post_to_bluesky(client, text, images=None):
+    """Post to Bluesky and return post URL. If images is provided (list of bytes), include them."""
     try:
-        response = client.send_post(text=text)
+        if images and len(images) > 0:
+            # Limit to MAX_IMAGES_PER_POST
+            images = images[:MAX_IMAGES_PER_POST]
+            response = client.send_images(text=text, images=images)
+        else:
+            response = client.send_post(text=text)
         logging.info(f"Successfully posted to Bluesky: {text[:50]}...")
 
         # Convert AT URI to web URL using the handle from BSKY_USER
@@ -130,32 +146,98 @@ def post_to_bluesky(client, text):
         return {"success": False, "error": str(e)}
 
 
+def _get_signal_rpc_reply(frame):
+    """Send a JSON-RPC frame to signal-cli socket and return parsed reply."""
+    req_id = frame.get("id")
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
+        s.connect(SIGNAL_SOCKET_PATH)
+        s.sendall((json.dumps(frame) + "\n").encode())
+        buf = b""
+        while not buf.endswith(b"\n"):
+            chunk = s.recv(1024)
+            if not chunk:
+                break
+            buf += chunk
+    reply = json.loads(buf)
+    if req_id is not None and reply.get("id") != req_id:
+        raise RuntimeError("Mismatching JSON-RPC id")
+    if "error" in reply:
+        raise RuntimeError(f"Signal error: {reply['error']}")
+    return reply
+
+
+def get_signal_attachment(attachment_id, group_id=None, recipient=None):
+    """Fetch an attachment via signal-cli getAttachment. Returns dict with content_type, data_b64, filename (optional)."""
+    req_id = str(uuid.uuid4())
+    params = {
+        "account": SIGNAL_ACCOUNT,
+        "id": attachment_id,
+    }
+    if group_id:
+        params["groupId"] = group_id
+    elif recipient:
+        params["recipient"] = recipient
+
+    frame = {
+        "jsonrpc": "2.0",
+        "method": "getAttachment",
+        "params": params,
+        "id": req_id,
+    }
+
+    reply = _get_signal_rpc_reply(frame)
+
+    # getAttachment response shape may vary; try common keys
+    result = reply.get("result", reply)
+    content_type = (
+        result.get("contentType")
+        or result.get("content_type")
+        or result.get("attachment", {}).get("contentType")
+    )
+    data_b64 = (
+        result.get("data")
+        or result.get("base64")
+        or result.get("attachment", {}).get("data")
+    )
+    filename = result.get("filename") or result.get("attachment", {}).get("filename")
+
+    if not data_b64:
+        raise RuntimeError("getAttachment returned no data")
+
+    return {
+        "content_type": content_type,
+        "data_b64": data_b64,
+        "filename": filename,
+    }
+
+
 def get_latest_post(client):
     """Get the most recent post from the authenticated user"""
     try:
         # Get the user's profile timeline (their posts)
         timeline = client.get_author_feed(client.me.did, limit=1)
-        
+
         if not timeline.feed or len(timeline.feed) == 0:
             return {"success": False, "error": "No posts found"}
-        
+
         post = timeline.feed[0].post
-        
+
         # Convert AT URI to web URL using handle
         handle = BSKY_USER
         if not handle.endswith(".bsky.social"):
             handle = f"{handle}.bsky.social"
-        
+
         post_url = at_uri_to_bsky_url(post.uri, handle)
-        
+
         return {
             "success": True,
             "uri": post.uri,
             "cid": post.cid,
             "url": post_url,
-            "text": post.record.text[:50] + ("..." if len(post.record.text) > 50 else "")
+            "text": post.record.text[:50]
+            + ("..." if len(post.record.text) > 50 else ""),
         }
-        
+
     except Exception as e:
         logging.error(f"Failed to get latest post: {e}")
         return {"success": False, "error": str(e)}
@@ -211,7 +293,14 @@ def delete_bluesky_post(client, url):
         return {"success": False, "error": str(e)}
 
 
-def send_signal_message(group_id, message, preview_url=None, preview_title=None, preview_description=None, preview_image=None):
+def send_signal_message(
+    group_id,
+    message,
+    preview_url=None,
+    preview_title=None,
+    preview_description=None,
+    preview_image=None,
+):
     """Send message to Signal group. If preview fields are provided, include them."""
     req_id = str(uuid.uuid4())
 
@@ -288,6 +377,7 @@ def parse_signal_message(message_data):
         # Extract relevant fields
         parsed = {
             "timestamp": envelope.get("timestamp"),
+            "source": envelope.get("source"),
             "source_uuid": envelope.get("sourceUuid"),
             "source_name": envelope.get("sourceName"),
             "message": message_content,
@@ -301,7 +391,11 @@ def parse_signal_message(message_data):
             parsed["quote_id"] = quote.get("id")
             parsed["quote_author"] = quote.get("author")
             parsed["quote_text"] = quote.get("text")
-            parsed["has_quote"] = bool(parsed["quote_text"]) if parsed.get("quote_text") is not None else False
+            parsed["has_quote"] = (
+                bool(parsed["quote_text"])
+                if parsed.get("quote_text") is not None
+                else False
+            )
         else:
             parsed["has_quote"] = False
 
@@ -310,6 +404,22 @@ def parse_signal_message(message_data):
         if group_info:
             parsed["group_id"] = group_info.get("groupId")
             parsed["is_group"] = True
+
+        # Capture attachments metadata if present
+        attachments = data_message.get("attachments") or []
+        normalized = []
+        for a in attachments:
+            try:
+                normalized.append(
+                    {
+                        "id": a.get("id"),
+                        "contentType": a.get("contentType"),
+                        "filename": a.get("filename"),
+                    }
+                )
+            except Exception:
+                continue
+        parsed["attachments"] = normalized
 
         logging.debug(f"Parsed message: {parsed}")
         return parsed
@@ -386,13 +496,22 @@ def listen_for_posts():
 
                                 # Check if message starts with /post, /delete, /help, or /echo
                                 # For /post: prefer quoted text if present
-                                is_post_cmd = parsed["message"].strip().lower().startswith("/post")
+                                is_post_cmd = (
+                                    parsed["message"]
+                                    .strip()
+                                    .lower()
+                                    .startswith("/post")
+                                )
                                 inline_post_text = extract_command_text(
                                     parsed["message"], "post"
                                 )
                                 quoted_text = parsed.get("quote_text")
                                 final_post_text = None
-                                if quoted_text and isinstance(quoted_text, str) and quoted_text.strip():
+                                if (
+                                    quoted_text
+                                    and isinstance(quoted_text, str)
+                                    and quoted_text.strip()
+                                ):
                                     final_post_text = quoted_text.strip()
                                 elif inline_post_text and inline_post_text.strip():
                                     final_post_text = inline_post_text.strip()
@@ -401,87 +520,171 @@ def listen_for_posts():
                                 )
                                 # Check for /help command (with or without text)
                                 help_text = None
-                                if parsed["message"].strip().lower().startswith("/help"):
-                                    help_text = ""  # Set to empty string to trigger help
-                                
+                                if (
+                                    parsed["message"]
+                                    .strip()
+                                    .lower()
+                                    .startswith("/help")
+                                ):
+                                    help_text = (
+                                        ""  # Set to empty string to trigger help
+                                    )
+
                                 echo_text = extract_command_text(
                                     parsed["message"], "echo"
                                 )
 
-                                if is_post_cmd and final_post_text:
-                                    logging.info("DETECTED /post command")
-                                    logging.info(
-                                        f"From: {parsed['source_name']} ({parsed['source_uuid']})"
-                                    )
-                                    if quoted_text and quoted_text.strip():
-                                        logging.info("Using quoted text for /post")
-                                    logging.info(f"Post text: {final_post_text}")
+                                if is_post_cmd:
+                                    # Check if we have attachments (for image-only posts)
+                                    has_attachments = bool(parsed.get("attachments")) and not parsed.get("has_quote")
+                                    
+                                    # Process if we have text OR attachments
+                                    if final_post_text or has_attachments:
+                                        logging.info("DETECTED /post command")
+                                        logging.info(
+                                            f"From: {parsed['source_name']} ({parsed['source_uuid']})"
+                                        )
+                                        if quoted_text and quoted_text.strip():
+                                            logging.info("Using quoted text for /post")
+                                        if final_post_text:
+                                            logging.info(f"Post text: {final_post_text}")
+                                        else:
+                                            logging.info("No text - posting image(s) only")
 
-                                    # Post to Bluesky
-                                    result = post_to_bluesky(bluesky_client, final_post_text)
-                                    if result["success"]:
-                                        url = result.get("url")
-                                        if url:
-                                            # Build preview title from env (full account name)
-                                            title = BSKY_USER or ""
-                                            if title and not title.startswith("@"):
-                                                title = f"@{title}"
-                                            # Use the posted text as the preview description
-                                            description = final_post_text
-                                            # Send only the URL and include preview fields for rich preview
-                                            send_signal_message(
-                                                SIGNAL_GROUP,
-                                                url,
-                                                preview_url=url,
-                                                preview_title=title,
-                                                preview_description=description,
+                                        # Collect images if no quote and attachments are present
+                                        images_bytes = []
+                                        if not parsed.get("has_quote"):
+                                            atts = parsed.get("attachments") or []
+                                        if atts:
+                                            logging.debug(
+                                                f"Found {len(atts)} attachment(s) in message"
+                                            )
+                                            for att in atts:
+                                                if (
+                                                    len(images_bytes)
+                                                    >= MAX_IMAGES_PER_POST
+                                                ):
+                                                    break
+                                                ctype = att.get("contentType")
+                                                if ctype not in ALLOWED_IMAGE_MIME:
+                                                    logging.debug(
+                                                        f"Skipping non-image/unsupported type: {ctype}"
+                                                    )
+                                                    continue
+                                                # Get attachment id - can be numeric or string
+                                                raw_id = att.get("id")
+                                                filename_hint = att.get("filename")
+
+                                                # Accept both numeric and string attachment IDs
+                                                if raw_id is not None:
+                                                    att_id = raw_id
+                                                else:
+                                                    logging.debug(
+                                                        f"Skipping attachment without id: {att}"
+                                                    )
+                                                    continue
+                                                try:
+                                                    # Try to fetch the attachment
+                                                    fetched = get_signal_attachment(
+                                                        att_id,
+                                                        group_id=parsed.get("group_id"),
+                                                        recipient=parsed.get("source"),
+                                                    )
+                                                    data_b64 = fetched.get("data_b64")
+                                                    img_bytes = base64.b64decode(
+                                                        data_b64
+                                                    )
+                                                    if (
+                                                        len(img_bytes)
+                                                        > MAX_ATTACHMENT_SIZE_BYTES
+                                                    ):
+                                                        logging.warning(
+                                                            f"Attachment {att_id} too large, skipping"
+                                                        )
+                                                        continue
+                                                    images_bytes.append(img_bytes)
+                                                    logging.info(
+                                                        f"Successfully fetched attachment: {att_id}"
+                                                    )
+                                                except Exception as e:
+                                                    logging.warning(
+                                                        f"Failed to fetch attachment id={att_id} filename={filename_hint}: {e}"
+                                                    )
+                                                    continue
+
+                                        # Post to Bluesky with optional images
+                                        # Use empty string if no text but we have images
+                                        post_text = final_post_text or ""
+                                        result = post_to_bluesky(
+                                            bluesky_client,
+                                            post_text,
+                                            images=images_bytes,
+                                        )
+                                        if result["success"]:
+                                            url = result.get("url")
+                                            if url:
+                                                # Build preview title from env (full account name)
+                                                title = BSKY_USER or ""
+                                                if title and not title.startswith("@"):
+                                                    title = f"@{title}"
+                                                # Use the posted text as the preview description (or indicate image-only)
+                                                description = final_post_text or "📷 Image"
+                                                # Send only the URL and include preview fields for rich preview
+                                                send_signal_message(
+                                                    SIGNAL_GROUP,
+                                                    url,
+                                                    preview_url=url,
+                                                    preview_title=title,
+                                                    preview_description=description,
+                                                )
+                                            else:
+                                                # Fallback if URL couldn't be derived
+                                                send_signal_message(
+                                                    SIGNAL_GROUP, "Posted to Bluesky"
+                                                )
+                                            logging.info(
+                                                f"Successfully posted to Bluesky and confirmed in Signal. URL: {result.get('url')}"
                                             )
                                         else:
-                                            # Fallback if URL couldn't be derived
                                             send_signal_message(
-                                                SIGNAL_GROUP, "Posted to Bluesky"
+                                                SIGNAL_GROUP, "L Failed to post to Bluesky"
                                             )
-                                        logging.info(
-                                            f"Successfully posted to Bluesky and confirmed in Signal. URL: {result.get('url')}"
-                                        )
+                                            logging.error(
+                                                f"Failed to post to Bluesky: {result.get('error')}"
+                                            )
                                     else:
+                                        # /post command without text or valid attachments
                                         send_signal_message(
-                                            SIGNAL_GROUP, "L Failed to post to Bluesky"
+                                            SIGNAL_GROUP,
+                                            "L No content to post. Include text or images with your /post command.",
                                         )
-                                        logging.error(
-                                            f"Failed to post to Bluesky: {result.get('error')}"
-                                        )
-                                elif is_post_cmd and not final_post_text:
-                                    # /post command without usable text or quote
-                                    send_signal_message(
-                                        SIGNAL_GROUP,
-                                        "L No text to post. Reply with /post to a message or include text.",
-                                    )
 
                                 elif delete_text:
                                     logging.info("DETECTED /delete command")
                                     logging.info(
                                         f"From: {parsed['source_name']} ({parsed['source_uuid']})"
                                     )
-                                    
+
                                     # Check if it's "delete this" command
                                     if delete_text.strip().lower() == "this":
-                                        logging.info("Delete this - getting latest post")
-                                        
+                                        logging.info(
+                                            "Delete this - getting latest post"
+                                        )
+
                                         # Get the latest post
                                         latest_result = get_latest_post(bluesky_client)
                                         if not latest_result["success"]:
                                             send_signal_message(
                                                 SIGNAL_GROUP,
-                                                f"L Failed to get latest post: {latest_result.get('error')}"
+                                                f"L Failed to get latest post: {latest_result.get('error')}",
                                             )
                                             continue
-                                        
+
                                         # Delete the latest post using its URL
                                         result = delete_bluesky_post(
                                             bluesky_client, latest_result["url"]
                                         )
-                                        
+
                                         if result["success"]:
                                             message = f"Deleted latest post from Bluesky\n{latest_result['url']}"
                                             send_signal_message(SIGNAL_GROUP, message)
@@ -491,7 +694,7 @@ def listen_for_posts():
                                         else:
                                             send_signal_message(
                                                 SIGNAL_GROUP,
-                                                f"L Failed to delete latest post: {result.get('error')}"
+                                                f"L Failed to delete latest post: {result.get('error')}",
                                             )
                                             logging.error(
                                                 f"Failed to delete latest post: {result.get('error')}"
@@ -499,7 +702,7 @@ def listen_for_posts():
                                     else:
                                         # Regular delete with URL
                                         logging.info(f"Delete URL: {delete_text}")
-                                        
+
                                         result = delete_bluesky_post(
                                             bluesky_client, delete_text.strip()
                                         )
