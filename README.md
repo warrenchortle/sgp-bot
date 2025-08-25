@@ -49,6 +49,22 @@ signal-cli -a +1234567890 daemon --socket
 ```
 3. Get your group ID by monitoring signal-cli output or using the listGroups command
 
+### Optional: Redaction
+
+You can configure a list of words to be automatically removed from any text before it is posted to Bluesky (and from the Signal preview description).
+
+- Env var: `REDACT_WORDS`
+- Format: comma-separated values (CSV)
+- Matching: case-insensitive, substring removal
+
+Example `.env` line:
+
+```env
+REDACT_WORDS=alice,charlie,projectx
+```
+
+If omitted, no redaction is performed.
+
 ## Usage
 
 ### Running with Docker (Recommended)

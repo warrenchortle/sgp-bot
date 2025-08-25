@@ -16,6 +16,7 @@ import io
 from dotenv import load_dotenv
 from atproto import Client
 from PIL import Image, ImageOps
+from typing import List
 
 # Load environment variables
 load_dotenv()
@@ -26,6 +27,7 @@ SIGNAL_SOCKET_PATH = os.getenv("SIGNAL_SOCKET_PATH", "/run/user/1000/signal-cli/
 SIGNAL_GROUP = os.getenv("SIGNAL_GROUP")
 BSKY_USER = os.getenv("BSKY_USER")
 BSKY_PASS = os.getenv("BSKY_PASS")
+REDACT_WORDS_ENV = os.getenv("REDACT_WORDS", "")
 
 # Attachment handling configuration
 MAX_IMAGES_PER_POST = 4
@@ -286,6 +288,31 @@ def _shrink_image_for_bluesky(image_bytes: bytes, mime: str | None = None) -> by
             return best_bytes
     except Exception:
         return image_bytes
+
+
+# ----- Redaction support -----
+def _parse_redact_words(raw: str) -> List[str]:
+    """Parse CSV redact words into a list (trimmed, no empties)."""
+    if not raw:
+        return []
+    return [w.strip() for w in raw.split(",") if w.strip()]
+
+
+_REDACT_WORDS: List[str] = _parse_redact_words(REDACT_WORDS_ENV)
+_REDACT_PATTERN = (
+    re.compile("|".join(re.escape(w) for w in _REDACT_WORDS), re.IGNORECASE)
+    if _REDACT_WORDS
+    else None
+)
+
+
+def redact_text(text: str) -> str:
+    """Remove all case-insensitive occurrences of configured words from text."""
+    if not text:
+        return text
+    if _REDACT_PATTERN is None:
+        return text
+    return _REDACT_PATTERN.sub("", text)
 
 
 def get_latest_post(client):
@@ -698,8 +725,8 @@ def listen_for_posts():
                                                     continue
 
                                         # Post to Bluesky with optional images
-                                        # Use empty string if no text but we have images
-                                        post_text = final_post_text or ""
+                                        # Redact text if configured; use empty string if only images
+                                        post_text = redact_text(final_post_text) if final_post_text else ""
                                         result = post_to_bluesky(
                                             bluesky_client,
                                             post_text,
@@ -713,7 +740,7 @@ def listen_for_posts():
                                                 if title and not title.startswith("@"):
                                                     title = f"@{title}"
                                                 # Use the posted text as the preview description (or indicate image-only)
-                                                description = final_post_text or "📷 Image"
+                                                description = post_text or "📷 Image"
                                                 # Send only the URL and include preview fields for rich preview
                                                 send_signal_message(
                                                     SIGNAL_GROUP,
