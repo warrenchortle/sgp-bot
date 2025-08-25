@@ -12,8 +12,10 @@ import sys
 import logging
 import uuid
 import re
+import io
 from dotenv import load_dotenv
 from atproto import Client
+from PIL import Image, ImageOps
 
 # Load environment variables
 load_dotenv()
@@ -27,13 +29,17 @@ BSKY_PASS = os.getenv("BSKY_PASS")
 
 # Attachment handling configuration
 MAX_IMAGES_PER_POST = 4
-MAX_ATTACHMENT_SIZE_BYTES = 15 * 1024 * 1024  # 15MB per image
+MAX_ATTACHMENT_SIZE_BYTES = 15 * 1024 * 1024  # 15MB per image - our limit
+BLUESKY_MAX_SIZE_BYTES = 976 * 1024  # 976KB - Bluesky's limit
 ALLOWED_IMAGE_MIME = {
     "image/jpeg",
     "image/png",
     "image/webp",
     "image/gif",
 }
+
+# Cap for longest side when downscaling for Bluesky
+MAX_IMAGE_DIMENSION = 2048
 
 
 def validate_environment():
@@ -209,6 +215,77 @@ def get_signal_attachment(attachment_id, group_id=None, recipient=None):
         "data_b64": data_b64,
         "filename": filename,
     }
+
+
+def _shrink_image_for_bluesky(image_bytes: bytes, mime: str | None = None) -> bytes:
+    """Resize/re-encode an image to be under Bluesky's blob size limit.
+
+    Strategy:
+    - Apply EXIF transpose to correct orientation.
+    - Convert to RGB and flatten alpha.
+    - Try JPEG re-encoding at several qualities; if still too large, iteratively downscale.
+
+    Returns the best-effort smaller bytes; returns original bytes on failure.
+    """
+    try:
+        if len(image_bytes) <= BLUESKY_MAX_SIZE_BYTES:
+            return image_bytes
+
+        with Image.open(io.BytesIO(image_bytes)) as im:
+            # Normalize orientation
+            try:
+                im = ImageOps.exif_transpose(im)
+            except Exception:
+                pass
+
+            # Convert to RGB and flatten any alpha
+            if im.mode in ("RGBA", "LA"):
+                bg = Image.new("RGB", im.size, (255, 255, 255))
+                bg.paste(im, mask=im.split()[-1])
+                im = bg
+            elif im.mode not in ("RGB", "L"):
+                im = im.convert("RGB")
+
+            def encode(img: Image.Image, quality: int) -> bytes:
+                buf = io.BytesIO()
+                img.save(buf, format="JPEG", quality=quality, optimize=True, progressive=True)
+                return buf.getvalue()
+
+            def resize_longest(img: Image.Image, target_longest: int) -> Image.Image:
+                w, h = img.size
+                longest = max(w, h)
+                if longest <= target_longest:
+                    return img
+                scale = target_longest / float(longest)
+                new_size = (max(1, int(w * scale)), max(1, int(h * scale)))
+                return img.resize(new_size, Image.LANCZOS)
+
+            # First attempt: keep resolution, lower quality a bit
+            for q in (85, 80, 75):
+                data = encode(im, q)
+                if len(data) <= BLUESKY_MAX_SIZE_BYTES:
+                    return data
+
+            # Iteratively downscale and re-encode
+            longest_targets = [MAX_IMAGE_DIMENSION, 1600, 1280, 1080, 960, 800, 720, 640]
+            quality_steps = [75, 70, 65, 60, 55, 50, 45, 40]
+
+            best_bytes = image_bytes
+            best_size = len(image_bytes)
+
+            work = im
+            for target in longest_targets:
+                work = resize_longest(work, target)
+                for q in quality_steps:
+                    data = encode(work, q)
+                    if len(data) < best_size:
+                        best_bytes, best_size = data, len(data)
+                    if len(data) <= BLUESKY_MAX_SIZE_BYTES:
+                        return data
+
+            return best_bytes
+    except Exception:
+        return image_bytes
 
 
 def get_latest_post(client):
@@ -553,12 +630,13 @@ def listen_for_posts():
 
                                         # Collect images if no quote and attachments are present
                                         images_bytes = []
+                                        atts = []
                                         if not parsed.get("has_quote"):
                                             atts = parsed.get("attachments") or []
-                                        if atts:
-                                            logging.debug(
-                                                f"Found {len(atts)} attachment(s) in message"
-                                            )
+                                            if atts:
+                                                logging.debug(
+                                                    f"Found {len(atts)} attachment(s) in message"
+                                                )
                                             for att in atts:
                                                 if (
                                                     len(images_bytes)
@@ -591,9 +669,7 @@ def listen_for_posts():
                                                         recipient=parsed.get("source"),
                                                     )
                                                     data_b64 = fetched.get("data_b64")
-                                                    img_bytes = base64.b64decode(
-                                                        data_b64
-                                                    )
+                                                    img_bytes = base64.b64decode(data_b64)
                                                     if (
                                                         len(img_bytes)
                                                         > MAX_ATTACHMENT_SIZE_BYTES
@@ -602,13 +678,22 @@ def listen_for_posts():
                                                             f"Attachment {att_id} too large, skipping"
                                                         )
                                                         continue
-                                                    images_bytes.append(img_bytes)
+                                                    # Downscale/compress to fit Bluesky blob limit
+                                                    processed = _shrink_image_for_bluesky(
+                                                        img_bytes, ctype
+                                                    )
+                                                    if len(processed) > BLUESKY_MAX_SIZE_BYTES:
+                                                        logging.warning(
+                                                            f"Attachment {att_id} still exceeds Bluesky size after processing; skipping"
+                                                        )
+                                                        continue
+                                                    images_bytes.append(processed)
                                                     logging.info(
                                                         f"Successfully fetched attachment: {att_id}"
                                                     )
                                                 except Exception as e:
                                                     logging.warning(
-                                                        f"Failed to fetch attachment id={att_id} filename={filename_hint}: {e}"
+                                                        f"Failed to fetch/process attachment id={att_id} filename={filename_hint}: {e}"
                                                     )
                                                     continue
 
